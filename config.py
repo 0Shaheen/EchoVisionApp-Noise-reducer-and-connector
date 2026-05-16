@@ -32,29 +32,19 @@ MAX_REDUCTION_DB      = 12.0
 SPECTRAL_FLOOR        = 0.25
 CALIB_SEC             = 2.0       # seconds of silence recorded at startup
 
-# ── Transport Mode ────────────────────────────────────────────────────────────────
-# Set BT_MODE = True  to stream over Bluetooth RFCOMM (assistive device profile)
-# Set BT_MODE = False to stream over WiFi TCP        (default)
-BT_MODE             = False       # <-- CHANGE TO True FOR BLUETOOTH
-
-# ── TCP Audio Stream (BT_MODE = False) ───────────────────────────────────────────
-# The RPi opens a TCP server. The phone connects to rpi_ip:STREAM_PORT
-# and receives a standard WAV-header followed by continuous raw PCM16 mono audio.
-STREAM_HOST         = "0.0.0.0"   # listen on all interfaces
-STREAM_PORT         = 8888        # <-- CHANGE IF NEEDED
-
-# ── Bluetooth RFCOMM Stream (BT_MODE = True) ─────────────────────────────────────
-# The RPi registers an RFCOMM serial service via SDP.
-# The phone pairs once via bluetoothctl, then connects by service name.
-# Device class 0x200448 (Hearing Aid) is set in /etc/bluetooth/main.conf
+# ── Bluetooth RFCOMM Stream ──────────────────────────────────────────────────────
+# The RPi registers an RFCOMM serial service via SDP.  The EchoVision phone
+# app pairs with the RPi once via bluetoothctl, then connects by the SDP
+# service name and receives a WAV header followed by continuous PCM16 mono
+# audio.  Device class 0x200448 (Hearing Aid) is set in /etc/bluetooth/main.conf
 # so Android lists the RPi under Accessibility → Hearing Aids.
 BT_SERVICE_NAME     = "SmartGlassesAudio"
 BT_RFCOMM_CHANNEL   = 1           # 1–30; BlueZ assigns automatically if in use
 
-# ── Output Audio Format ───────────────────────────────────────────────────────────
+# ── Output Audio Format ──────────────────────────────────────────────────────────
 OUT_SAMPLE_RATE     = 16000       # Hz
 OUT_CHANNELS        = 1           # mono
 OUT_BITS            = 16          # PCM16
 
-# ── Logging ───────────────────────────────────────────────────────────────────────
+# ── Logging ──────────────────────────────────────────────────────────────────────
 LOG_LEVEL           = "INFO"

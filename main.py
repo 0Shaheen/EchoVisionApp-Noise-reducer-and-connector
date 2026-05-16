@@ -2,15 +2,11 @@
 main.py — Smart Glasses RPi Zero 2W Audio Pipeline
 ====================================================
 
-What this does:
-  1. Starts a stream server (WiFi TCP or Bluetooth RFCOMM — set BT_MODE in config.py)
-  2. Records 2 s of silence to calibrate the noise floor
-  3. Continuously captures stereo audio from 2x INMP441 microphones
-  4. Processes audio: DOA estimation → beamforming → Wiener filter
-  5. Streams clean mono 16 kHz PCM16 audio to the phone
-
-The phone simply connects to the stream URL / BT service and receives
-clean audio.  STT (Whisper large-v3) runs entirely on the phone side.
+Captures stereo audio from 2× INMP441 microphones, runs:
+  DOA estimation (SRP-PHAT) → delay-and-sum beamforming → Wiener
+  filter noise reduction
+and streams the processed 16 kHz mono PCM16 audio to the EchoVision
+phone app over Bluetooth Classic RFCOMM.
 
 Start manually:
   python3 main.py
@@ -30,20 +26,12 @@ import numpy as np
 from config import (
     SAMPLE_RATE, CHUNK_FRAMES, DOA_WINDOW_SEC, DOA_SMOOTHING,
     LOG_LEVEL, CALIB_SEC, BEAMFORMER_CONFIDENCE_THRESHOLD,
-    BT_MODE,
 )
-from audio_capture  import DualMicCapture
-from srp_phat       import SRPPHATProcessor
-from beamformer     import DelayAndSumBeamformer
-from noise_reducer  import WienerFilter
-
-# ── Choose transport based on BT_MODE flag in config.py ──────────────────────
-if BT_MODE:
-    from bluetooth_streamer import BluetoothStreamServer as StreamServer
-    TRANSPORT_LABEL = "Bluetooth RFCOMM (assistive device)"
-else:
-    from audio_streamer import AudioStreamServer as StreamServer
-    TRANSPORT_LABEL = "WiFi TCP"
+from audio_capture      import DualMicCapture
+from srp_phat           import SRPPHATProcessor
+from beamformer         import DelayAndSumBeamformer
+from noise_reducer      import WienerFilter
+from bluetooth_streamer import BluetoothStreamServer
 
 logging.basicConfig(
     level    = getattr(logging, LOG_LEVEL, logging.INFO),
@@ -67,7 +55,7 @@ class SmartGlassesPipeline:
         self.doa      = SRPPHATProcessor()
         self.bf       = DelayAndSumBeamformer()
         self.nr       = WienerFilter()
-        self.server   = StreamServer()          # WiFi or BT depending on config
+        self.server   = BluetoothStreamServer()
         self._running = False
 
         self._doa_l: list[np.ndarray] = []
@@ -141,10 +129,10 @@ class SmartGlassesPipeline:
         print("  ╔══════════════════════════════════════════════════╗")
         print("  ║       Smart Glasses — Audio Stream Server        ║")
         print("  ╠══════════════════════════════════════════════════╣")
-        print(f"  ║  Transport : {TRANSPORT_LABEL:<35} ║")
+        print(f"  ║  Transport : Bluetooth RFCOMM                    ║")
         print(f"  ║  {stream_info:<48} ║")
         print("  ║                                                  ║")
-        print("  ║  Connect phone to receive clean processed audio  ║")
+        print("  ║  Pair the EchoVision phone app to receive audio  ║")
         print("  ║  (16 kHz mono PCM16)                             ║")
         print("  ╚══════════════════════════════════════════════════╝")
         print()
@@ -152,13 +140,10 @@ class SmartGlassesPipeline:
         self.capture.start()
 
         is_mono  = False
-        use_bf   = self._calibrate()
-        self._use_bf = use_bf
+        self._use_bf = self._calibrate()
 
         print()
         print("  ► Streaming — waiting for phone to connect ...")
-        if BT_MODE:
-            print("  ► Phone: python3 phone_receiver.py --bt --addr <RPi BT addr>")
         print("  ► Press Ctrl+C to stop")
         print()
 
