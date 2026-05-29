@@ -4,15 +4,24 @@ bluetooth_streamer.py — Bluetooth RFCOMM Audio Stream Server (stdlib)
 Streams processed mono PCM16 audio to the EchoVision phone app over
 Bluetooth Classic RFCOMM, using ONLY the Python standard library
 (the `socket` module with AF_BLUETOOTH / BTPROTO_RFCOMM).  There is NO
-pybluez / pybluez2 dependency, so this works out of the box on
-Python 3.13 with no C-extension to compile.
+pybluez / pybluez2 dependency, so this works on Python 3.13 with no
+C-extension to compile.
 
-Streaming protocol (unchanged):
-  [44 bytes]  WAV header  (16 kHz, mono, PCM16)
-  [inf bytes] Raw int16 PCM — continuous stream
+----------------------------------------------------------------------
+Wire framing (binary-safe)
+----------------------------------------------------------------------
+The Android client (react-native-bluetooth-classic) reads the RFCOMM
+stream as newline-delimited text and STRIPS the delimiter.  Sending raw
+PCM would let any 0x0A ("\\n") sample byte be silently deleted, shifting
+byte alignment and turning speech into noise.  To stay binary-safe each
+audio chunk is framed as:
 
-Bandwidth: 16 kHz x 2 bytes x 1 ch ~= 32 KB/s  (~256 kbps).
-BT Classic RFCOMM supports ~700 kbps — comfortable headroom.
+    base64(pcm16_le_bytes) + b"\\n"
+
+base64 uses only 7-bit ASCII (A-Z a-z 0-9 + / =), so it never contains
+0x0A; the trailing newline is an unambiguous frame separator.  The phone
+splits on "\\n", base64-decodes each frame back to PCM16, and feeds it to
+Whisper.  Overhead is ~33% (≈43 KB/s) — well within RFCOMM's ~700 kbps.
 
 ----------------------------------------------------------------------
 SDP service discovery (one-time Pi setup)
@@ -23,35 +32,30 @@ UUID to an RFCOMM channel via an SDP record on the Pi.  The stdlib
 socket module cannot create SDP records, so we register one with the
 `sdptool` utility, which requires BlueZ running in compatibility mode.
 
-Enable it once:
-  1. Edit the bluetooth unit and add --compat to the daemon line:
-       sudoedit /lib/systemd/system/bluetooth.service
-     Change the ExecStart line to (path may be /usr/libexec/... ):
-       ExecStart=/usr/libexec/bluetooth/bluetoothd --compat
+Enable it once (only needed if the phone can't discover the channel):
+  1. Add --compat to the bluetoothd ExecStart line, e.g.:
+       /etc/systemd/system/bluetooth.service.d/override.conf
+         [Service]
+         ExecStart=
+         ExecStart=/usr/libexec/bluetooth/bluetoothd -E --compat
   2. sudo systemctl daemon-reload
   3. sudo systemctl restart bluetooth
 
-start() then calls `sdptool add` for you automatically.  If compat mode
-is off the call is skipped with a warning; pairing/streaming may still
-work if the phone falls back to RFCOMM channel 1.
+start() calls `sdptool add` for you automatically; if compat mode is off
+the call is skipped with a warning and the phone falls back to channel 1.
 
 Pair the phone once via bluetoothctl, then it reconnects on every boot.
 """
 
-import io
+import base64
 import logging
 import queue
 import socket
-import struct
 import subprocess
 import threading
-import wave
 import numpy as np
 
-from config import (
-    BT_SERVICE_NAME, BT_RFCOMM_CHANNEL,
-    OUT_SAMPLE_RATE, OUT_CHANNELS, OUT_BITS,
-)
+from config import BT_SERVICE_NAME, BT_RFCOMM_CHANNEL
 
 log = logging.getLogger(__name__)
 
@@ -64,24 +68,6 @@ BDADDR_ANY = getattr(socket, "BDADDR_ANY", "00:00:00:00:00:00")
 
 def _float32_to_pcm16(audio: np.ndarray) -> bytes:
     return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-
-
-def _make_wav_header() -> bytes:
-    """
-    44-byte WAV header with data size = 0xFFFFFFFF (streaming / unknown).
-    Identical to the original — any client that handled that stream works
-    here without modification.
-    """
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(OUT_CHANNELS)
-        wf.setsampwidth(OUT_BITS // 8)
-        wf.setframerate(OUT_SAMPLE_RATE)
-        wf.setnframes(0)
-    hdr = bytearray(buf.getvalue())
-    struct.pack_into("<I", hdr,  4, 0xFFFFFFFF)
-    struct.pack_into("<I", hdr, 40, 0xFFFFFFFF)
-    return bytes(hdr)
 
 
 def _register_sdp_spp(channel: int) -> bool:
@@ -112,7 +98,8 @@ def _register_sdp_spp(channel: int) -> bool:
 
 class BluetoothStreamServer:
     """
-    Bluetooth RFCOMM server — streams processed mono PCM16 audio.
+    Bluetooth RFCOMM server — streams processed mono PCM16 audio as
+    newline-delimited base64 frames (see module docstring).
 
     Listens on an RFCOMM channel and publishes an SPP SDP record so the
     phone can find it.  Accepts one client at a time; if the phone
@@ -120,7 +107,7 @@ class BluetoothStreamServer:
     push() discards the oldest chunk rather than blocking if the send
     queue is full.
 
-    Usage (API identical to the previous pybluez2 version):
+    Usage (API identical to the previous versions):
         srv = BluetoothStreamServer()
         info = srv.start()   # returns a human-readable status string
         srv.push(audio)      # float32 numpy array in [-1, 1]
@@ -169,7 +156,7 @@ class BluetoothStreamServer:
         self._send_thread.start()
 
         return (f"Bluetooth RFCOMM  ch={self._channel}  "
-                f"service={BT_SERVICE_NAME!r}  (SPP / stdlib socket)")
+                f"service={BT_SERVICE_NAME!r}  (SPP / base64 frames / stdlib socket)")
 
     def stop(self):
         self._running = False
@@ -205,7 +192,7 @@ class BluetoothStreamServer:
     # ── Internal threads ──────────────────────────────────────────────────────
 
     def _accept_loop(self):
-        """Block on accept(), send the WAV header, register the new client."""
+        """Block on accept() and register the new client. base64 frames follow."""
         while self._running:
             try:
                 self._server_sock.settimeout(1.0)
@@ -222,16 +209,7 @@ class BluetoothStreamServer:
             log.info("Phone connected via BT: %s", addr)
             print(f"\n  +  Phone connected via Bluetooth: {addr}")
 
-            # Send the WAV header so the phone can skip it once per connection.
-            try:
-                conn.sendall(_make_wav_header())
-            except OSError:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                continue
-
+            # No up-front header: newline-delimited base64 PCM frames follow.
             with self._client_lock:
                 if self._client_sock:
                     try:
@@ -241,7 +219,7 @@ class BluetoothStreamServer:
                 self._client_sock = conn
 
     def _send_loop(self):
-        """Dequeue PCM bytes and forward them to the connected phone."""
+        """Dequeue PCM bytes, base64-frame them, and forward to the phone."""
         while self._running:
             try:
                 pcm = self._send_queue.get(timeout=0.05)
@@ -254,7 +232,8 @@ class BluetoothStreamServer:
                 continue   # no phone connected — discard
 
             try:
-                client.sendall(pcm)
+                # Binary-safe frame: base64 payload + newline separator.
+                client.sendall(base64.b64encode(pcm) + b"\n")
             except OSError:
                 log.info("BT link dropped — waiting for phone to reconnect ...")
                 print("  x  BT link dropped — waiting for phone to reconnect ...")
