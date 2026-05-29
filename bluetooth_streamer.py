@@ -1,49 +1,52 @@
 """
-bluetooth_streamer.py — Bluetooth RFCOMM Audio Stream Server
-============================================================
-Drop-in replacement for audio_streamer.py using Bluetooth Classic
-RFCOMM instead of WiFi TCP.  The streaming protocol is identical:
+bluetooth_streamer.py — Bluetooth RFCOMM Audio Stream Server (stdlib)
+====================================================================
+Streams processed mono PCM16 audio to the EchoVision phone app over
+Bluetooth Classic RFCOMM, using ONLY the Python standard library
+(the `socket` module with AF_BLUETOOTH / BTPROTO_RFCOMM).  There is NO
+pybluez / pybluez2 dependency, so this works out of the box on
+Python 3.13 with no C-extension to compile.
+
+Streaming protocol (unchanged):
   [44 bytes]  WAV header  (16 kHz, mono, PCM16)
-  [∞ bytes]   Raw int16 PCM — continuous stream
+  [inf bytes] Raw int16 PCM — continuous stream
 
-The RPi registers an SDP service named "SmartGlassesAudio" so the
-phone can discover it by name rather than a hard-coded channel number.
-
-BlueZ device class is configured externally (see BT_SETUP section in
-SETUP_GUIDE.txt) to 0x200448:
-  Major service  : Audio  (bit 21)
-  Major device   : Audio/Video  (0x04 << 8)
-  Minor device   : Hearing Aid  (0x12 << 2 = 0x48)
-→ Android surfaces the paired RPi under
-  Settings → Accessibility → Hearing aids in the Bluetooth menu.
-
-Bandwidth: 16 kHz × 2 bytes × 1 ch ≈ 32 KB/s  (~256 kbps)
+Bandwidth: 16 kHz x 2 bytes x 1 ch ~= 32 KB/s  (~256 kbps).
 BT Classic RFCOMM supports ~700 kbps — comfortable headroom.
 
-Pair once via bluetoothctl (see SETUP_GUIDE.txt §BT), then the phone
-reconnects automatically on every boot.
+----------------------------------------------------------------------
+SDP service discovery (one-time Pi setup)
+----------------------------------------------------------------------
+The Android app connects using the standard Serial Port Profile (SPP)
+UUID 00001101-0000-1000-8000-00805F9B34FB.  Android resolves the SPP
+UUID to an RFCOMM channel via an SDP record on the Pi.  The stdlib
+socket module cannot create SDP records, so we register one with the
+`sdptool` utility, which requires BlueZ running in compatibility mode.
 
-Phone side:
-  python3 phone_receiver.py --bt --addr DC:A6:32:XX:XX:XX
+Enable it once:
+  1. Edit the bluetooth unit and add --compat to the daemon line:
+       sudoedit /lib/systemd/system/bluetooth.service
+     Change the ExecStart line to (path may be /usr/libexec/... ):
+       ExecStart=/usr/libexec/bluetooth/bluetoothd --compat
+  2. sudo systemctl daemon-reload
+  3. sudo systemctl restart bluetooth
+
+start() then calls `sdptool add` for you automatically.  If compat mode
+is off the call is skipped with a warning; pairing/streaming may still
+work if the phone falls back to RFCOMM channel 1.
+
+Pair the phone once via bluetoothctl, then it reconnects on every boot.
 """
 
 import io
 import logging
 import queue
+import socket
 import struct
+import subprocess
 import threading
 import wave
 import numpy as np
-
-try:
-    import bluetooth
-except ImportError as exc:
-    raise ImportError(
-        "pybluez2 is required for Bluetooth mode.\n"
-        "  RPi  : pip install pybluez2\n"
-        "  Phone: pip install pybluez2\n"
-        "  Also : sudo apt-get install bluetooth libbluetooth-dev"
-    ) from exc
 
 from config import (
     BT_SERVICE_NAME, BT_RFCOMM_CHANNEL,
@@ -52,9 +55,9 @@ from config import (
 
 log = logging.getLogger(__name__)
 
-# Fixed UUID for SDP advertisement — must match phone_receiver.py
-# Generated once; do NOT change after the first pairing.
-SMART_GLASSES_UUID = "94f39d29-7d6d-437d-973b-fba39e49d4ef"
+# Bind to any local Bluetooth adapter.  Provided by CPython's socket
+# module when built with Bluetooth support; fall back to the literal.
+BDADDR_ANY = getattr(socket, "BDADDR_ANY", "00:00:00:00:00:00")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -66,8 +69,8 @@ def _float32_to_pcm16(audio: np.ndarray) -> bytes:
 def _make_wav_header() -> bytes:
     """
     44-byte WAV header with data size = 0xFFFFFFFF (streaming / unknown).
-    Identical to the TCP version — any client that handles that stream
-    works here without modification.
+    Identical to the original — any client that handled that stream works
+    here without modification.
     """
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -81,79 +84,108 @@ def _make_wav_header() -> bytes:
     return bytes(hdr)
 
 
+def _register_sdp_spp(channel: int) -> bool:
+    """
+    Best-effort: publish a Serial Port Profile SDP record on `channel`
+    via `sdptool` so Android can resolve the SPP UUID to our channel.
+    Requires BlueZ compat mode (-C / --compat).  Failure is non-fatal.
+    """
+    try:
+        subprocess.run(
+            ["sdptool", "add", f"--channel={channel}", "SP"],
+            check=True, capture_output=True, timeout=5,
+        )
+        log.info("SDP: Serial Port Profile registered on RFCOMM channel %d", channel)
+        return True
+    except FileNotFoundError:
+        log.warning("SDP: 'sdptool' not found — install the 'bluez' package")
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode(errors="ignore").strip()
+        log.warning("SDP: sdptool failed (%s). Enable BlueZ compat mode "
+                    "(add --compat to bluetoothd).", detail or exc.returncode)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("SDP: registration skipped (%s)", exc)
+    return False
+
+
 # ── Server ────────────────────────────────────────────────────────────────────
 
 class BluetoothStreamServer:
     """
     Bluetooth RFCOMM server — streams processed mono PCM16 audio.
 
-    Registers "SmartGlassesAudio" via SDP.  Accepts one client at a
-    time; if the phone disconnects it waits silently and reconnects on
-    the next accept().  Push() discards the oldest chunk rather than
-    blocking if the send queue is full.
+    Listens on an RFCOMM channel and publishes an SPP SDP record so the
+    phone can find it.  Accepts one client at a time; if the phone
+    disconnects it waits silently and reconnects on the next accept().
+    push() discards the oldest chunk rather than blocking if the send
+    queue is full.
 
-    Usage (mirrors AudioStreamServer):
+    Usage (API identical to the previous pybluez2 version):
         srv = BluetoothStreamServer()
-        url = srv.start()   # returns "Bluetooth RFCOMM  addr=...  ch=..."
-        srv.push(audio)     # float32 numpy array
+        info = srv.start()   # returns a human-readable status string
+        srv.push(audio)      # float32 numpy array in [-1, 1]
         srv.stop()
     """
 
     def __init__(self):
-        self._server_sock  = None
-        self._client_sock  = None
-        self._client_lock  = threading.Lock()
+        self._server_sock = None
+        self._client_sock = None
+        self._client_lock = threading.Lock()
         self._send_queue: queue.Queue[bytes] = queue.Queue(maxsize=64)
-        self._running      = False
+        self._running = False
+        self._channel = BT_RFCOMM_CHANNEL
         self._accept_thread = threading.Thread(
             target=self._accept_loop, daemon=True, name="bt-accept")
-        self._send_thread   = threading.Thread(
-            target=self._send_loop,  daemon=True, name="bt-send")
+        self._send_thread = threading.Thread(
+            target=self._send_loop, daemon=True, name="bt-send")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self) -> str:
-        """Open RFCOMM server socket, advertise via SDP, start threads."""
-        self._server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
-        self._server_sock.bind(("", BT_RFCOMM_CHANNEL))
-        self._server_sock.listen(1)
-        actual_ch = self._server_sock.getsockname()[1]
+        """Open the RFCOMM server socket, register SDP, start the threads."""
+        if not hasattr(socket, "AF_BLUETOOTH"):
+            raise RuntimeError(
+                "This Python build has no AF_BLUETOOTH support — cannot open "
+                "a Bluetooth socket.  Use the system Python on Raspberry Pi OS."
+            )
 
-        bluetooth.advertise_service(
-            self._server_sock,
-            BT_SERVICE_NAME,
-            service_id      = SMART_GLASSES_UUID,
-            service_classes = [SMART_GLASSES_UUID, bluetooth.SERIAL_PORT_CLASS],
-            profiles        = [bluetooth.SERIAL_PORT_PROFILE],
-            description     = "Smart Glasses assistive audio — 16 kHz PCM16 mono",
-        )
-        log.info("SDP service %r advertised on RFCOMM channel %d",
-                 BT_SERVICE_NAME, actual_ch)
+        self._server_sock = socket.socket(
+            socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+        try:
+            self._server_sock.bind((BDADDR_ANY, BT_RFCOMM_CHANNEL))
+        except OSError as exc:
+            # Configured channel busy — let the kernel pick a free one.
+            log.warning("RFCOMM channel %d unavailable (%s) — auto-selecting",
+                        BT_RFCOMM_CHANNEL, exc)
+            self._server_sock.bind((BDADDR_ANY, 0))
+
+        self._server_sock.listen(1)
+        self._channel = self._server_sock.getsockname()[1]
+
+        _register_sdp_spp(self._channel)
 
         self._running = True
         self._accept_thread.start()
         self._send_thread.start()
 
-        try:
-            local_addr = bluetooth.read_local_bdaddr()
-        except Exception:
-            local_addr = "??"
-
-        return (f"Bluetooth RFCOMM  addr={local_addr}  "
-                f"ch={actual_ch}  service={BT_SERVICE_NAME!r}")
+        return (f"Bluetooth RFCOMM  ch={self._channel}  "
+                f"service={BT_SERVICE_NAME!r}  (SPP / stdlib socket)")
 
     def stop(self):
         self._running = False
-        try:
-            bluetooth.stop_advertising(self._server_sock)
-        except Exception:
-            pass
-        for sock in [self._client_sock, self._server_sock]:
-            if sock:
+        with self._client_lock:
+            if self._client_sock:
                 try:
-                    sock.close()
+                    self._client_sock.close()
                 except Exception:
                     pass
+                self._client_sock = None
+        if self._server_sock:
+            try:
+                self._server_sock.close()
+            except Exception:
+                pass
+            self._server_sock = None
 
     def push(self, audio: np.ndarray):
         """
@@ -166,32 +198,38 @@ class BluetoothStreamServer:
             self._send_queue.put_nowait(pcm)
         except queue.Full:
             try:    self._send_queue.get_nowait()
-            except: pass
+            except Exception: pass
             try:    self._send_queue.put_nowait(pcm)
-            except: pass
+            except Exception: pass
 
     # ── Internal threads ──────────────────────────────────────────────────────
 
     def _accept_loop(self):
-        """Block on accept(), send WAV header, register the new client."""
+        """Block on accept(), send the WAV header, register the new client."""
         while self._running:
             try:
                 self._server_sock.settimeout(1.0)
                 conn, info = self._server_sock.accept()
-            except bluetooth.btcommon.BluetoothError:
-                continue   # timeout — loop and re-check _running
+            except socket.timeout:
+                continue   # re-check _running and loop
             except OSError:
+                if self._running:
+                    continue
                 break
 
-            addr, ch = info
-            log.info("Phone connected via BT: %s  ch%d", addr, ch)
-            print(f"\n  ✓  Phone connected via Bluetooth: {addr}")
+            conn.settimeout(None)
+            addr = info[0] if isinstance(info, (tuple, list)) else info
+            log.info("Phone connected via BT: %s", addr)
+            print(f"\n  +  Phone connected via Bluetooth: {addr}")
 
-            # Send WAV header so phone_receiver.py can skip it
+            # Send the WAV header so the phone can skip it once per connection.
             try:
                 conn.sendall(_make_wav_header())
-            except bluetooth.btcommon.BluetoothError:
-                conn.close()
+            except OSError:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
                 continue
 
             with self._client_lock:
@@ -217,8 +255,13 @@ class BluetoothStreamServer:
 
             try:
                 client.sendall(pcm)
-            except (bluetooth.btcommon.BluetoothError, OSError):
+            except OSError:
                 log.info("BT link dropped — waiting for phone to reconnect ...")
-                print("  ✗  BT link dropped — waiting for phone to reconnect ...")
+                print("  x  BT link dropped — waiting for phone to reconnect ...")
                 with self._client_lock:
-                    self._client_sock = None
+                    if self._client_sock is client:
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
+                        self._client_sock = None
