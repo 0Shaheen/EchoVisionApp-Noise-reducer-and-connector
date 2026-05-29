@@ -8,7 +8,12 @@ CHANNELS            = 2           # stereo: Left mic = ch0, Right mic = ch1
 CAPTURE_DTYPE       = "int32"     # INMP441: 24-bit audio in 32-bit I2S frames
 INMP441_BIT_SHIFT   = 8           # right-shift to recover 24-bit value
 CHUNK_FRAMES        = 512         # samples per processing block (~32 ms)
-ALSA_DEVICE         = "hw:sndrpigooglevoi,0"   # <-- CHANGE IF NEEDED (check: arecord -l)
+# sounddevice/PortAudio device: an integer index OR a (case-insensitive)
+# substring of the device name from `python3 audio_capture.py`.
+# NOTE: ALSA-style "hw:card,dev" strings do NOT work here — use the PortAudio
+# name. "sysdefault" routes through ALSA (handles format/rate) and works on the
+# Google voiceHAT / INMP441 I2S setup.  Use "default" or an index if needed.
+ALSA_DEVICE         = "sysdefault"   # <-- CHANGE IF NEEDED (list: python3 audio_capture.py)
 
 # ── Microphone Array ─────────────────────────────────────────────────────────────
 MIC_SEPARATION_M    = 0.065       # metres — measure your actual glasses frame
@@ -33,13 +38,12 @@ SPECTRAL_FLOOR        = 0.25
 CALIB_SEC             = 2.0       # seconds of silence recorded at startup
 
 # ── Bluetooth RFCOMM Stream ──────────────────────────────────────────────────────
-# The RPi registers an RFCOMM serial service via SDP.  The EchoVision phone
-# app pairs with the RPi once via bluetoothctl, then connects by the SDP
-# service name and receives a WAV header followed by continuous PCM16 mono
-# audio.  Device class 0x200448 (Hearing Aid) is set in /etc/bluetooth/main.conf
-# so Android lists the RPi under Accessibility → Hearing Aids.
+# The RPi listens on an RFCOMM channel and (in BlueZ compat mode) publishes a
+# Serial Port Profile SDP record.  The EchoVision phone app pairs with the RPi
+# once via bluetoothctl, then connects over SPP and receives a WAV header
+# followed by continuous PCM16 mono audio.
 BT_SERVICE_NAME     = "SmartGlassesAudio"
-BT_RFCOMM_CHANNEL   = 1           # 1–30; BlueZ assigns automatically if in use
+BT_RFCOMM_CHANNEL   = 1           # 1–30; auto-selected if the channel is busy
 
 # ── Output Audio Format ──────────────────────────────────────────────────────────
 OUT_SAMPLE_RATE     = 16000       # Hz
