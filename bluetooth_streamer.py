@@ -53,6 +53,7 @@ import queue
 import socket
 import subprocess
 import threading
+import time
 import numpy as np
 
 from config import BT_SERVICE_NAME, BT_RFCOMM_CHANNEL
@@ -126,6 +127,12 @@ class BluetoothStreamServer:
         self._send_thread = threading.Thread(
             target=self._send_loop, daemon=True, name="bt-send")
 
+        # --- DIAGNOSTIC: throughput counters (samples/sec produced vs sent) ---
+        self._diag_pushed = 0     # samples handed to push() in the last window
+        self._diag_sent = 0       # samples actually written to the socket
+        self._diag_dropped = 0    # frames dropped because the queue was full
+        self._diag_last = None
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self) -> str:
@@ -180,10 +187,12 @@ class BluetoothStreamServer:
         If no phone is connected the PCM bytes are silently discarded.
         If the queue is full the oldest chunk is dropped to prevent lag.
         """
+        self._diag_pushed += len(audio)
         pcm = _float32_to_pcm16(audio)
         try:
             self._send_queue.put_nowait(pcm)
         except queue.Full:
+            self._diag_dropped += 1
             try:    self._send_queue.get_nowait()
             except Exception: pass
             try:    self._send_queue.put_nowait(pcm)
@@ -224,23 +233,37 @@ class BluetoothStreamServer:
             try:
                 pcm = self._send_queue.get(timeout=0.05)
             except queue.Empty:
-                continue
+                pcm = None
 
-            with self._client_lock:
-                client = self._client_sock
-            if client is None:
-                continue   # no phone connected — discard
-
-            try:
-                # Binary-safe frame: base64 payload + newline separator.
-                client.sendall(base64.b64encode(pcm) + b"\n")
-            except OSError:
-                log.info("BT link dropped — waiting for phone to reconnect ...")
-                print("  x  BT link dropped — waiting for phone to reconnect ...")
+            if pcm is not None:
                 with self._client_lock:
-                    if self._client_sock is client:
-                        try:
-                            client.close()
-                        except Exception:
-                            pass
-                        self._client_sock = None
+                    client = self._client_sock
+                if client is not None:
+                    try:
+                        # Binary-safe frame: base64 payload + newline separator.
+                        client.sendall(base64.b64encode(pcm) + b"\n")
+                        self._diag_sent += len(pcm) // 2
+                    except OSError:
+                        log.info("BT link dropped — waiting for phone to reconnect ...")
+                        print("  x  BT link dropped — waiting for phone to reconnect ...")
+                        with self._client_lock:
+                            if self._client_sock is client:
+                                try:
+                                    client.close()
+                                except Exception:
+                                    pass
+                                self._client_sock = None
+
+            # --- DIAGNOSTIC: log produced-vs-sent throughput once per second ---
+            now = time.monotonic()
+            if self._diag_last is None:
+                self._diag_last = now
+            elif now - self._diag_last >= 1.0:
+                log.info("[RATE] produced=%d samp/s  sent=%d samp/s  "
+                         "dropped=%d frames/s  queue=%d/64",
+                         self._diag_pushed, self._diag_sent,
+                         self._diag_dropped, self._send_queue.qsize())
+                self._diag_pushed = 0
+                self._diag_sent = 0
+                self._diag_dropped = 0
+                self._diag_last = now
