@@ -29,7 +29,16 @@ BEAMFORMER_CONFIDENCE_THRESHOLD = 2.0
 # ── Beamformer ───────────────────────────────────────────────────────────────────
 BEAM_GAIN           = 2.0
 
+# ── Noise Reducer Selection ──────────────────────────────────────────────────────
+# False → noise_reducer.py          (original Wiener filter — stable, lighter)
+# True  → noise_reducer_improved.py (MMSE-LSA + decision-directed SNR + speech
+#         presence probability — more natural speech, better fricative
+#         preservation, slightly more CPU)
+# Both expose the same WienerFilter class, so only this flag changes which is used.
+USE_IMPROVED_NOISE_REDUCER = False
+
 # ── Wiener Filter Noise Reduction ────────────────────────────────────────────────
+# Shared by both reducers (the improved one ignores WIENER_OVERESTIMATE).
 NOISE_REDUCE_ENABLED  = True
 NOISE_FLOOR_DECAY     = 0.998
 WIENER_OVERESTIMATE   = 1.5
@@ -40,8 +49,8 @@ CALIB_SEC             = 2.0       # seconds of silence recorded at startup
 # ── Bluetooth RFCOMM Stream ──────────────────────────────────────────────────────
 # The RPi listens on an RFCOMM channel and (in BlueZ compat mode) publishes a
 # Serial Port Profile SDP record.  The EchoVision phone app pairs with the RPi
-# once via bluetoothctl, then connects over SPP and receives a WAV header
-# followed by continuous PCM16 mono audio.
+# once via bluetoothctl, then connects over SPP and receives newline-delimited
+# base64 frames of continuous PCM16 mono audio.
 BT_SERVICE_NAME     = "SmartGlassesAudio"
 BT_RFCOMM_CHANNEL   = 1           # 1–30; auto-selected if the channel is busy
 
