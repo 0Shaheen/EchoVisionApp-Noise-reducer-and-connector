@@ -3,8 +3,9 @@ main.py — Smart Glasses RPi Zero 2W Audio Pipeline
 ====================================================
 
 Captures stereo audio from 2× INMP441 microphones, runs:
-  DOA estimation (SRP-PHAT) → delay-and-sum beamforming → Wiener
-  filter noise reduction
+  DOA estimation (SRP-PHAT) → delay-and-sum beamforming → noise
+  reduction (Wiener filter, or the MMSE-LSA enhancer when
+  USE_IMPROVED_NOISE_REDUCER is enabled in config.py)
 and streams the processed 16 kHz mono PCM16 audio to the EchoVision
 phone app over Bluetooth Classic RFCOMM.
 
@@ -26,11 +27,18 @@ import numpy as np
 from config import (
     SAMPLE_RATE, CHUNK_FRAMES, DOA_WINDOW_SEC, DOA_SMOOTHING,
     LOG_LEVEL, CALIB_SEC, BEAMFORMER_CONFIDENCE_THRESHOLD,
+    USE_IMPROVED_NOISE_REDUCER,
 )
 from audio_capture      import DualMicCapture
 from srp_phat           import SRPPHATProcessor
 from beamformer         import DelayAndSumBeamformer
-from noise_reducer      import WienerFilter
+# Pick the noise reducer at import time. Both modules expose WienerFilter
+# with an identical calibrate()/process() API, so the rest of the pipeline
+# is unaffected.  Flip USE_IMPROVED_NOISE_REDUCER in config.py to switch.
+if USE_IMPROVED_NOISE_REDUCER:
+    from noise_reducer_improved import WienerFilter   # MMSE-LSA speech enhancer
+else:
+    from noise_reducer          import WienerFilter   # original Wiener filter
 from bluetooth_streamer import BluetoothStreamServer
 
 logging.basicConfig(
@@ -39,6 +47,8 @@ logging.basicConfig(
     handlers = [logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("main")
+log.info("Noise reducer: %s",
+         "MMSE-LSA (improved)" if USE_IMPROVED_NOISE_REDUCER else "Wiener (original)")
 
 
 def _mix(bf, use_bf, is_mono, l, r):
