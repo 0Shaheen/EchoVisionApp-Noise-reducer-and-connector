@@ -22,6 +22,7 @@ Stop:
 import logging
 import signal
 import sys
+import time
 import numpy as np
 
 from config import (
@@ -159,15 +160,43 @@ class SmartGlassesPipeline:
 
         self._running = True
 
+        # --- DIAGNOSTIC: per-stage timing, logged once per second ---
+        t_acc = {"read": 0.0, "doa": 0.0, "mix": 0.0, "nr": 0.0, "push": 0.0, "n": 0}
+        t_log = time.monotonic()
+
         try:
             while self._running:
+                _a = time.monotonic()
                 left, right = self.capture.read_chunk()
+                _b = time.monotonic()
                 self._update_doa(left, right)
+                _c = time.monotonic()
                 mono    = _mix(self.bf, self._use_bf, is_mono, left, right)
+                _d = time.monotonic()
                 cleaned = self.nr.process(mono)
-                if len(cleaned) == 0:
-                    continue
-                self.server.push(cleaned)
+                _e = time.monotonic()
+
+                t_acc["read"] += _b - _a
+                t_acc["doa"]  += _c - _b
+                t_acc["mix"]  += _d - _c
+                t_acc["nr"]   += _e - _d
+                t_acc["n"]    += 1
+
+                if len(cleaned) != 0:
+                    self.server.push(cleaned)
+                    t_acc["push"] += time.monotonic() - _e
+
+                now = time.monotonic()
+                if now - t_log >= 1.0:
+                    n = max(1, t_acc["n"])
+                    log.info("[TIMING] iters=%d/s  read=%.1f  doa=%.1f  mix=%.1f  "
+                             "nr=%.1f  push=%.1f  ms/iter",
+                             t_acc["n"],
+                             1000 * t_acc["read"] / n, 1000 * t_acc["doa"] / n,
+                             1000 * t_acc["mix"]  / n, 1000 * t_acc["nr"]  / n,
+                             1000 * t_acc["push"] / n)
+                    t_acc = {"read": 0.0, "doa": 0.0, "mix": 0.0, "nr": 0.0, "push": 0.0, "n": 0}
+                    t_log = now
 
         except KeyboardInterrupt:
             print()
